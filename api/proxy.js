@@ -200,12 +200,46 @@ const LANDING_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// MIME type map for common file extensions
+const MIME_TYPES = {
+    '.html': 'text/html',
+    '.css': 'text/css',
+    '.js': 'application/javascript',
+    '.mjs': 'application/javascript',
+    '.json': 'application/json',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon',
+    '.webp': 'image/webp',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.ttf': 'font/ttf',
+    '.otf': 'font/otf',
+    '.mp4': 'video/mp4',
+    '.webm': 'video/webm',
+    '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
+    '.pdf': 'application/pdf',
+    '.xml': 'application/xml',
+    '.txt': 'text/plain',
+    '.map': 'application/json',
+    '.wasm': 'application/wasm',
+};
+
+function getMimeFromPath(urlPath) {
+    const ext = (urlPath.match(/\.[a-zA-Z0-9]+(?:\?|$)/) || [''])[0].replace('?', '');
+    return MIME_TYPES[ext.toLowerCase()] || null;
+}
+
 export default async function handler(req, res) {
-    // Parse the xeno_proxy cookie
+    // Parse cookies
     const cookies = {};
     (req.headers.cookie || '').split(';').forEach(c => {
-        const [key, val] = c.trim().split('=');
-        if (key) cookies[key] = val;
+        const [key, ...rest] = c.trim().split('=');
+        if (key) cookies[key] = rest.join('=');
     });
 
     // No cookie = show landing page
@@ -217,11 +251,16 @@ export default async function handler(req, res) {
 
     // Cookie exists = proxy to xeno.now
     try {
-        const path = req.query.path ? `/${req.query.path.join('/')}` : '/';
+        // Get original path from the __path query param injected by vercel.json rewrite
+        const originalPath = req.query.__path || '';
+        const path = originalPath ? `/${originalPath}` : '/';
+
+        // Rebuild query string without our internal __path param
         const queryString = Object.entries(req.query)
-            .filter(([key]) => key !== 'path')
-            .map(([key, val]) => `${key}=${val}`)
+            .filter(([key]) => key !== '__path')
+            .map(([key, val]) => `${encodeURIComponent(key)}=${encodeURIComponent(val)}`)
             .join('&');
+
         const targetUrl = `https://xeno.now${path}${queryString ? '?' + queryString : ''}`;
 
         const response = await fetch(targetUrl, {
@@ -229,22 +268,23 @@ export default async function handler(req, res) {
             headers: {
                 'User-Agent': req.headers['user-agent'] || '',
                 'Accept': req.headers['accept'] || '*/*',
-                'Accept-Encoding': req.headers['accept-encoding'] || '',
                 'Accept-Language': req.headers['accept-language'] || '',
+                'Referer': 'https://xeno.now/',
             },
             redirect: 'follow',
         });
 
-        // Forward content-type and cache headers
-        const contentType = response.headers.get('content-type');
+        // Use the upstream content-type, but fall back to MIME detection from the path
+        const contentType = response.headers.get('content-type') || getMimeFromPath(path);
         if (contentType) res.setHeader('Content-Type', contentType);
 
+        // Forward cache headers
         const cacheControl = response.headers.get('cache-control');
         if (cacheControl) res.setHeader('Cache-Control', cacheControl);
 
         const body = Buffer.from(await response.arrayBuffer());
         return res.status(response.status).send(body);
     } catch (err) {
-        return res.status(502).send('Proxy error: unable to reach xeno.now');
+        return res.status(502).send('Proxy error: unable to reach xeno.now — ' + err.message);
     }
 }
