@@ -234,6 +234,64 @@ function getMimeFromPath(urlPath) {
     return MIME_TYPES[ext.toLowerCase()] || null;
 }
 
+// External domains to also proxy through
+const PROXIED_DOMAINS = [
+    'linkvertise.com',
+    'www.linkvertise.com',
+    'lootlabs.gg',
+    'www.lootlabs.gg',
+    'lootdest.org',
+    'www.lootdest.org',
+    'lootdest.com',
+    'www.lootdest.com',
+    'work.ink',
+    'www.work.ink',
+    'loot-link.com',
+    'www.loot-link.com',
+];
+
+// Rewrite HTML to route external links through the proxy
+function rewriteHtml(html) {
+    let result = html;
+    for (const domain of PROXIED_DOMAINS) {
+        // Rewrite https://domain/... → /__ext/domain/...
+        result = result.replaceAll(`https://${domain}/`, `/__ext/${domain}/`);
+        result = result.replaceAll(`http://${domain}/`, `/__ext/${domain}/`);
+        result = result.replaceAll(`https://${domain}"`, `/__ext/${domain}/"`)
+        result = result.replaceAll(`http://${domain}"`, `/__ext/${domain}/"`);
+    }
+    return result;
+}
+
+async function proxyRequest(targetUrl, req, res, referer) {
+    const response = await fetch(targetUrl, {
+        method: req.method,
+        headers: {
+            'User-Agent': req.headers['user-agent'] || '',
+            'Accept': req.headers['accept'] || '*/*',
+            'Accept-Language': req.headers['accept-language'] || '',
+            'Referer': referer,
+        },
+        redirect: 'follow',
+    });
+
+    const contentType = response.headers.get('content-type') || getMimeFromPath(targetUrl);
+    if (contentType) res.setHeader('Content-Type', contentType);
+
+    const cacheControl = response.headers.get('cache-control');
+    if (cacheControl) res.setHeader('Cache-Control', cacheControl);
+
+    // If response is HTML, rewrite external links
+    if (contentType && contentType.includes('text/html')) {
+        let html = await response.text();
+        html = rewriteHtml(html);
+        return res.status(response.status).send(html);
+    }
+
+    const body = Buffer.from(await response.arrayBuffer());
+    return res.status(response.status).send(body);
+}
+
 export default async function handler(req, res) {
     // Parse cookies
     const cookies = {};
@@ -249,7 +307,6 @@ export default async function handler(req, res) {
         return res.status(200).send(LANDING_HTML);
     }
 
-    // Cookie exists = proxy to xeno.now
     try {
         // Get original path from the __path query param injected by vercel.json rewrite
         const originalPath = req.query.__path || '';
@@ -260,31 +317,21 @@ export default async function handler(req, res) {
             .filter(([key]) => key !== '__path')
             .map(([key, val]) => `${encodeURIComponent(key)}=${encodeURIComponent(val)}`)
             .join('&');
+        const qs = queryString ? '?' + queryString : '';
 
-        const targetUrl = `https://xeno.now${path}${queryString ? '?' + queryString : ''}`;
+        // Check if this is an external domain proxy request: /__ext/domain.com/path
+        const extMatch = path.match(/^\/__ext\/([^/]+)(\/.*)?$/);
+        if (extMatch) {
+            const extDomain = extMatch[1];
+            const extPath = extMatch[2] || '/';
+            const targetUrl = `https://${extDomain}${extPath}${qs}`;
+            return await proxyRequest(targetUrl, req, res, `https://${extDomain}/`);
+        }
 
-        const response = await fetch(targetUrl, {
-            method: req.method,
-            headers: {
-                'User-Agent': req.headers['user-agent'] || '',
-                'Accept': req.headers['accept'] || '*/*',
-                'Accept-Language': req.headers['accept-language'] || '',
-                'Referer': 'https://xeno.now/',
-            },
-            redirect: 'follow',
-        });
-
-        // Use the upstream content-type, but fall back to MIME detection from the path
-        const contentType = response.headers.get('content-type') || getMimeFromPath(path);
-        if (contentType) res.setHeader('Content-Type', contentType);
-
-        // Forward cache headers
-        const cacheControl = response.headers.get('cache-control');
-        if (cacheControl) res.setHeader('Cache-Control', cacheControl);
-
-        const body = Buffer.from(await response.arrayBuffer());
-        return res.status(response.status).send(body);
+        // Default: proxy to xeno.now
+        const targetUrl = `https://xeno.now${path}${qs}`;
+        return await proxyRequest(targetUrl, req, res, 'https://xeno.now/');
     } catch (err) {
-        return res.status(502).send('Proxy error: unable to reach xeno.now — ' + err.message);
+        return res.status(502).send('Proxy error: ' + err.message);
     }
 }
