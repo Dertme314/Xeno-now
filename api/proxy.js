@@ -254,14 +254,85 @@ const PROXIED_DOMAINS = [
 function rewriteHtml(html) {
     let result = html;
     for (const domain of PROXIED_DOMAINS) {
-        // Rewrite https://domain/... → /__ext/domain/...
         result = result.replaceAll(`https://${domain}/`, `/__ext/${domain}/`);
         result = result.replaceAll(`http://${domain}/`, `/__ext/${domain}/`);
-        result = result.replaceAll(`https://${domain}"`, `/__ext/${domain}/"`)
+        result = result.replaceAll(`https://${domain}"`, `/__ext/${domain}/"`);
         result = result.replaceAll(`http://${domain}"`, `/__ext/${domain}/"`);
     }
     return result;
 }
+
+// Client-side script injected into every HTML page to intercept JS-generated links
+const INTERCEPT_SCRIPT = `<script>
+(function() {
+    const DOMAINS = ${JSON.stringify(PROXIED_DOMAINS)};
+
+    function rewriteUrl(url) {
+        try {
+            const u = new URL(url, window.location.origin);
+            for (const d of DOMAINS) {
+                if (u.hostname === d || u.hostname === 'www.' + d) {
+                    return '/__ext/' + u.hostname + u.pathname + u.search + u.hash;
+                }
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    // Intercept all link clicks
+    document.addEventListener('click', function(e) {
+        const a = e.target.closest('a');
+        if (!a || !a.href) return;
+        const rewritten = rewriteUrl(a.href);
+        if (rewritten) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (a.target === '_blank') {
+                window.open(rewritten, '_blank');
+            } else {
+                window.location.href = rewritten;
+            }
+        }
+    }, true);
+
+    // Override window.open
+    const origOpen = window.open.bind(window);
+    window.open = function(url, target, features) {
+        if (url) {
+            const rewritten = rewriteUrl(url);
+            if (rewritten) return origOpen(rewritten, target, features);
+        }
+        return origOpen(url, target, features);
+    };
+
+    // Override location assignment
+    const origAssign = window.location.assign.bind(window.location);
+    const origReplace = window.location.replace.bind(window.location);
+    window.location.assign = function(url) {
+        const rewritten = rewriteUrl(url);
+        return origAssign(rewritten || url);
+    };
+    window.location.replace = function(url) {
+        const rewritten = rewriteUrl(url);
+        return origReplace(rewritten || url);
+    };
+
+    // Rewrite href attributes on dynamically added links
+    new MutationObserver(function(mutations) {
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                const anchors = node.tagName === 'A' ? [node] : node.querySelectorAll ? node.querySelectorAll('a[href]') : [];
+                for (const a of anchors) {
+                    if (!a.href) continue;
+                    const rewritten = rewriteUrl(a.href);
+                    if (rewritten) a.href = rewritten;
+                }
+            }
+        }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+})();
+</script>`;
 
 async function proxyRequest(targetUrl, req, res, referer) {
     const response = await fetch(targetUrl, {
@@ -281,10 +352,12 @@ async function proxyRequest(targetUrl, req, res, referer) {
     const cacheControl = response.headers.get('cache-control');
     if (cacheControl) res.setHeader('Cache-Control', cacheControl);
 
-    // If response is HTML, rewrite external links
+    // If response is HTML, rewrite links + inject client-side interceptor
     if (contentType && contentType.includes('text/html')) {
         let html = await response.text();
         html = rewriteHtml(html);
+        // Inject interceptor script right after <head> tag
+        html = html.replace(/<head([^>]*)>/i, `<head$1>${INTERCEPT_SCRIPT}`);
         return res.status(response.status).send(html);
     }
 
